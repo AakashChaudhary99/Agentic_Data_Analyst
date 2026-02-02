@@ -1,31 +1,27 @@
 from dotenv import load_dotenv
-from langgraph.graph import StateGraph, START, END
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-import tempfile
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
-import shutil
+from fastapi.responses import StreamingResponse
+from langgraph.graph import StateGraph, START, END
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
-from fastapi.responses import StreamingResponse
-import io
-
-app = FastAPI()
 from typing import TypedDict, List, Optional, Dict, Any, Literal
-
+import pandas as pd
+import tempfile
+import shutil
+import io
 import os
-os.environ["OPENAI_API_KEY"] = ""
+from contextlib import asynccontextmanager
 
-app.add_middleware(
-  CORSMiddleware,
-  allow_origins=["http://localhost:5173"],
-  allow_credentials=True,
-  allow_methods=["*"],
-  allow_headers=["*"]
-)
+# -------------------------------------------------
+# FastAPI setup
+# -------------------------------------------------
 
-llm = ChatOpenAI()
+llm = ChatOpenAI(model="gpt-4.1-mini")
 
+# -------------------------------------------------
+# State & Schemas
+# -------------------------------------------------
 
 class IntentStructure(TypedDict):
     intent: str
@@ -34,192 +30,243 @@ class IntentStructure(TypedDict):
 class RequiredColsStructure(TypedDict):
     req_cols: List[str]
 
-intent_structured_llm = llm.with_structured_output(IntentStructure)
-
-class TransformationStep(BaseModel):
-    operation: str = Field(
-        description="Generic dataframe operation name, e.g. groupby, filter, order by, etc"
-    )
-    params: Dict[str, Any] = Field(
-        description="Parameters required to execute the operation"
-    )
-
-
 class TransformationPlan(BaseModel):
     steps: List[str]
 
 class AgentState(TypedDict):
     instruction: str
     file_path: str
-    output_mode: Literal["csv", 'text']
+    output_mode: Literal["csv", "text"]
     intent: str
     cols: List[str]
     req_cols: List[str]
+    text_output_transformation_plan: Optional[List[str]]
     text_output: str
-    sample_data: Dict[str, any]
+    sample_data: Dict[str, Any]
     transformation_plan: Optional[List[str]]
 
-def find_intent(state: AgentState):
-    instruction = state['instruction']
-    prompt = f"""
-        From this given instruction or question by the user: {instruction} for a csv file, Decide the 
-        1. User intent
-        2. Output type (If we solve this instruction or question, would the output be in the form of text or transformation is required?
-        if this instruction or question does not require transformation then text or else csv)
-    """
+# -------------------------------------------------
+# Structured LLMs (FORCED function_calling)
+# -------------------------------------------------
 
-    resp = intent_structured_llm.invoke(prompt)
-    return {"output_mode": resp['output_type'], "intent": resp['intent']}
+intent_structured_llm = llm.with_structured_output(
+    IntentStructure,
+    method="function_calling",
+)
+
+# -------------------------------------------------
+# Graph nodes
+# -------------------------------------------------
 
 def inspect_dataset_node(state: AgentState) -> AgentState:
     df = pd.read_csv(state["file_path"])
-
     state["cols"] = list(df.columns)
     state["sample_data"] = df.head(2).to_dict(orient="records")
-
     return state
 
 def column_selection_node(state: AgentState) -> AgentState:
-    structured_llm = llm.with_structured_output(RequiredColsStructure)
-    response = structured_llm.invoke(f"""
-    For the given instruction and columns name,
-    Instruction:
-    {state['instruction']}
+    structured_llm = llm.with_structured_output(
+        RequiredColsStructure,
+        method="function_calling",
+    )
 
-    Dataset columns:
-    {state['cols']}
+    response = structured_llm.invoke(
+        f"""
+        From below user instruction/question and the columns names of file,
+Instruction:
+{state['instruction']}
 
-    Return only required columns as a list which will be used to solve above instruction.
-    """)
+Columns:
+{state['cols']}
 
-    state["req_cols"] = response['req_cols']
+Return required columns only which will be used to solve the user's question/instruction.
+"""
+    )
+
+    state["req_cols"] = response["req_cols"]
     return state
+
+def find_intent(state: AgentState):
+    prompt = f"""
+From the instruction below, decide:
+1. intent
+2. output_type: text or csv
+
+Instruction:
+{state['instruction']}
+"""
+    resp = intent_structured_llm.invoke(prompt)
+    return {
+        "output_mode": resp["output_type"],
+        "intent": resp["intent"],
+    }
 
 def text_executor_node(state: AgentState) -> AgentState:
     df = pd.read_csv(state["file_path"])
-    df = df[state["required_columns"]]
+    # df = df[state["req_cols"]]
+    cols = state['cols']
+    req_cols = state['req_cols']
+    # print("SUmmary", summary)
+    structured_llm = llm.with_structured_output(
+        TransformationPlan,
+        method="function_calling",
+    )
+    response = structured_llm.invoke(
+        f"""
+        From given user's questions, all columns of file and required columns of file below
+Question:
+{state['instruction']}
 
-    summary = df.describe().to_string()
+All Columns: {cols}
+Required columns: {req_cols}
 
-    response = llm.invoke(f"""
-    Instruction:
-    {state['instruction']}
+Generate pandas transformation steps which will be enough to get a dataset df so that user's question can be answered.
 
-    Data summary:
-    {summary}
+Return JSON ONLY in this format:
+{{
+  "steps": [
+    "df = ...",
+    "df = ..."
+  ]
+}}.
+"""
+    )
 
-    Provide a concise insight.
+    # state["text_output"] = response.content
+    state['text_output_transformation_plan'] = response.steps
+    # print("RESP", response.steps)
+    transformed_df = apply_transformation_plan_safe(df, response.steps)
+    text_response = llm.invoke(f"""
+        From given pandas df as a string and user question below
+        df: {transformed_df.to_string()}
+        Question: {state['instruction']}
+        ,
+        provide an answer for that question. Just a brief answer nothing else
     """)
-
-    state["text_output"] = response["text"]
+    state['text_output'] = text_response.content
     return state
 
 def plan_generator_node(state: AgentState) -> AgentState:
-    structured_llm = llm.with_structured_output(TransformationPlan)
-    response = structured_llm.invoke(f"""
-    You are a senior Python data engineer.
+    structured_llm = llm.with_structured_output(
+        TransformationPlan,
+        method="function_calling",
+    )
 
-Your task is to generate EXACT pandas code to solve the user instruction.
+    response = structured_llm.invoke(
+        f"""
+Generate pandas transformation steps.
 
-IMPORTANT RULES (DO NOT BREAK):
-- Use ONLY pandas operations
-- Assume a pandas DataFrame named `df` already exists
-- Do NOT import anything
-- Do NOT read or write files
-- Do NOT use print statements
-- Do NOT explain anything
-- Do NOT return markdown
-- Do NOT return plain text
+Return JSON ONLY in this format:
+{{
+  "steps": [
+    "df = ...",
+    "df = ..."
+  ]
+}}
 
-OUTPUT FORMAT (STRICT):
-- Return a list of all operation required step by step
-- Each element must be a SINGLE pandas statement as a STRING
-- Each statement must be executable in order
-- Each statement must reassign to `df` if it modifies the dataframe
-
-
-DATASET SCHEMA:
 Columns: {state['cols']}
-
-Sample rows:
-{state['sample_data']}
-
-USER INSTRUCTION:
-{state['instruction']}
-
-RETURN ONLY THIS (NO EXTRA TEXT):
-[
-  "df = ...",
-  "df = ..."
-]
-
-    """)
+Sample: {state['sample_data']}
+Instruction: {state['instruction']}
+"""
+    )
 
     state["transformation_plan"] = response.steps
     return state
 
+def route_by_output(state: AgentState) -> Literal["text", "csv"]:
+    return state["output_mode"]
+
+# -------------------------------------------------
+# Graph build
+# -------------------------------------------------
 
 graph = StateGraph(AgentState)
 
-# add nodes
-graph.add_node('find_intent', find_intent)
 graph.add_node("inspect_dataset", inspect_dataset_node)
-graph.add_node("column_selection_node", column_selection_node)
-graph.add_node("text_exec", text_executor_node)
-graph.add_node('plan_generator_node', plan_generator_node)
+graph.add_node("column_selection", column_selection_node)
+graph.add_node("find_intent", find_intent)
+graph.add_node("text", text_executor_node)
+graph.add_node("csv", plan_generator_node)
 
-graph.add_edge(START, 'find_intent')
-graph.add_edge('find_intent', 'inspect_dataset')
-graph.add_edge('inspect_dataset', 'column_selection_node')
-graph.add_edge('column_selection_node', 'plan_generator_node')
-graph.add_edge('plan_generator_node', END)
+graph.add_edge(START, "inspect_dataset")
+graph.add_edge("inspect_dataset", "column_selection")
+graph.add_edge("column_selection", "find_intent")
 
-workflow = graph.compile()
+graph.add_conditional_edges(
+    "find_intent",
+    route_by_output,
+    {
+        "text": "text",
+        "csv": "csv",
+    },
+)
+
+graph.add_edge("text", END)
+graph.add_edge("csv", END)
+
+workflow = None
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
 
 def apply_transformation_plan_safe(df, plan):
-    safe_globals = {
-        "__builtins__": {},  # blocks open, import, eval, etc.
-    }
-    safe_locals = {
-        "df": df
-    }
-
     for step in plan:
         exec(step)
-
     return df
 
-@app.get('/')
+
+# -------------------------------------------------
+# APIs
+# -------------------------------------------------
+@asynccontextmanager
+async def lifespan(app:FastAPI):
+    global workflow
+    workflow = graph.compile()
+    yield
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+@app.get("/")
 def health_check():
+    print("HEALTH CHECK HIT")
     return {"Message": "API is healthy"}
 
-@app.post('/processing')
-async def processing_file(file: UploadFile=File(...), instruction:str=Form(...)):
-    try:
-        print("Received", instruction)
-        global workflow
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as tmp:
-            tmp_path = tmp.name
-            shutil.copyfileobj(file.file, tmp)
+@app.post("/processing")
+def processing_file(
+    file: UploadFile = File(...),
+    instruction: str = Form(...),
+):
+    print("Inside processing")
+    global workflow
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+        tmp_path = tmp.name
+        shutil.copyfileobj(file.file, tmp)
 
-        op = workflow.invoke({"instruction": instruction, 'file_path': tmp_path})
-        df = pd.read_csv(tmp_path)
-        transformations = op['transformation_plan']
-        new_df = apply_transformation_plan_safe(df, transformations)
-        print(new_df)
-        buffer = io.StringIO()
-        new_df.to_csv(buffer, index=False)
-        buffer.seek(0)
-        print(buffer)
-        return StreamingResponse(
-            buffer,
-            media_type="text/csv",
-            headers={
-                "Content-Disposition": "attachment; filename=output.csv"
-            }
-        )
+    op = workflow.invoke(
+        {"instruction": instruction, "file_path": tmp_path}
+    )
+    print("OP", op)
+    if op["output_mode"] == "text":
+        return op["text_output"]
 
-        # return {"status":"ok", 'data': op}
+    df = pd.read_csv(tmp_path)
+    new_df = apply_transformation_plan_safe(
+        df, op["transformation_plan"]
+    )
 
-    except Exception as e:
-        print(e)
+    buffer = io.StringIO()
+    new_df.to_csv(buffer, index=False)
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": "attachment; filename=output.csv"
+        },
+    )
